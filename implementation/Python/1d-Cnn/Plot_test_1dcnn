@@ -1,0 +1,124 @@
+import sys
+import os
+
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+sys.path.append(project_root)
+
+import json
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from scipy.signal import savgol_filter
+
+# Import for the 1D-CNN model
+from Class_models.CNN_1D import CNN_1D
+
+# Path to the test dataset and model files
+TEST_FILE = "Dataset_mv/test_soh.npz"  
+MODEL_PATH = "Models_fp32/model_soh_1dcnn.pth"
+BEST_PARAMS_PATH = "Models_fp32/model_soh_1dcnn_best_params.json"
+
+if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    # 1. Upload the best hyperparameters from the JSON file
+    if os.path.exists(BEST_PARAMS_PATH):
+        with open(BEST_PARAMS_PATH, "r") as f:
+            best_params = json.load(f)
+        print(f"--> Uploading parameters from: {BEST_PARAMS_PATH}")
+        
+        filters = best_params.get("filters", [32, 64])
+        kernel_size = best_params.get("kernel_size", 5)
+        hidden_neurons = best_params.get("dense_units", 32)
+    else:
+        print(f"[WARNING] Best parameters file not found in {BEST_PARAMS_PATH}. Using default values.")
+        filters = [32, 64]
+        kernel_size = 5
+        hidden_neurons = 32
+
+    # 2. Upload the test set
+    print(f"--> Loading test set from: {TEST_FILE} ...")
+    data = np.load(TEST_FILE)
+    X_test = data['X_test'] 
+    Y_test = data['Y_test']  
+
+    total_samples = len(X_test)
+    print(f"Test samples loaded: {total_samples:,}")
+
+    # 3. Initialization and Loading of the 1D-CNN Model
+    input_shape = (2, 128)
+    model = CNN_1D(
+        input_shape=input_shape,
+        filters=filters,
+        kernel_size=kernel_size,
+        hidden_neurons=hidden_neurons
+    ).to(device)
+
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    model.eval()
+
+    num_params = sum(p.numel() for p in model.parameters())
+    print(f" 1D-CNN model successfully loaded ({num_params:,} parameters).")
+
+    # 4. Batch Prediction and Inference
+    BATCH_SIZE = 1024
+    preds_list = []
+
+    print("\n--> Block inference calculation...")
+    with torch.inference_mode():
+        for i in range(0, total_samples, BATCH_SIZE):
+            end_idx = min(i + BATCH_SIZE, total_samples)
+            
+            # Shape conversion for PyTorch Conv1D: (Batch, 128, 2) -> (Batch, 2, 128)
+            batch_x = torch.tensor(X_test[i:end_idx], dtype=torch.float32).permute(0, 2, 1).to(device)
+            
+            outputs = model(batch_x)
+            preds_list.append(outputs.cpu().numpy())
+
+    # Concatenate all predictions and flatten the array
+    predictions = np.concatenate(preds_list).flatten()
+    # Application of Moving Average or Savitzky-Golay to filter high-frequency noise
+    smoothed_predictions = savgol_filter(predictions, window_length=30, polyorder=2)
+
+    # 5. Metric Calculation
+    mae = mean_absolute_error(Y_test, predictions)
+    mae_smooth = mean_absolute_error(Y_test, smoothed_predictions)
+    rmse = np.sqrt(mean_squared_error(Y_test, predictions))
+    mape = np.mean(np.abs((Y_test - predictions) / (Y_test + 1e-8))) * 100
+
+    print("\n" + "=" * 55)
+    print("       1D-CNN RESULTS ON TEST CELLS")
+    print("=" * 55)
+    print(f"• MAE  (Mean Absolute Error)     : {mae:.4f}  -> MAE after Smoothing: {mae_smooth:.4f}")
+    print(f"• RMSE (Root Mean Square Error)  : {rmse:.4f}")
+    print(f"• MAPE (Mean Absolute % Error)   : {mape:.2f}%")
+    print("=" * 55)
+
+    # 6. PLOT GENERATION
+
+    # Plot 1: Ground Truth vs 1D-CNN Predictions
+    plt.figure(figsize=(14, 6))
+    plt.plot(Y_test, label="Ground Truth (Actual SoH)", color='black', alpha=0.8, linewidth=1.2)
+    plt.plot(smoothed_predictions, label="1D-CNN Prediction", color='blue', alpha=0.7, linewidth=1.0)
+    
+    plt.title(f"1D-CNN Test Set Evaluation | MAE: {mae*100:.2f}% -> Smooth MAE: {mae_smooth*100:.2f}% - RMSE: {rmse:.4f}", fontsize=14)
+    plt.xlabel("Time Window Index (Concatenated Test Cells)", fontsize=11)
+    plt.ylabel("State of Health (SoH)", fontsize=11)
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.legend(fontsize=12, loc="upper right")
+    plt.tight_layout()
+    plt.show()
+
+    # Plot 2: Instantaneous Residual Error (%)
+    residuals = (Y_test - predictions) * 100
+    plt.figure(figsize=(14, 4))
+    plt.plot(residuals, color='crimson', alpha=0.5, linewidth=0.8)
+    plt.axhline(0, color='black', linestyle='--', linewidth=1)
+    plt.title("1D-CNN Instantaneous Residual Error (Actual SoH - Predicted SoH) [%]", fontsize=12)
+    plt.xlabel("Time Window Index", fontsize=10)
+    plt.ylabel("Error [%]", fontsize=10)
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    plt.show()
